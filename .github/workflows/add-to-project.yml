@@ -102,11 +102,21 @@ jobs:
             exit 0
           fi
 
-          gh project item-edit \
-            --id "$ITEM_ID" \
-            --project-id "$PROJECT_ID" \
-            --field-id "$FIELD_ID" \
-            --single-select-option-id "$OPTION_ID"
+          # Use the GraphQL mutation directly instead of `gh project
+          # item-edit`. The CLI subcommand erroneously demands the
+          # `read:discussion` scope on top of `project`+`read:org`,
+          # which makes PATs minted with the minimum-viable scope set
+          # 403 even though the underlying mutation works. The
+          # mutation path needs only `project`+`read:org`.
+          gh api graphql -f query='
+            mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $p, itemId: $i, fieldId: $f,
+                value: { singleSelectOptionId: $o }
+              }) { projectV2Item { id } }
+            }' \
+            -F p="$PROJECT_ID" -F i="$ITEM_ID" -F f="$FIELD_ID" -F o="$OPTION_ID" \
+            --jq '.data.updateProjectV2ItemFieldValue.projectV2Item.id'
 
           echo "✓ Component stamped"
 
