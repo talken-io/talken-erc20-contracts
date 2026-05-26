@@ -1,0 +1,155 @@
+name: Add to Project
+
+# Auto-add new issues / PRs from this repo to Talken Project #1 and
+# stamp the project's `Component` field with the value of
+# `vars.TALKEN_COMPONENT` (Contracts / SDK / API / Swap FE / Wallet FE /
+# Wallet BE / Mobile / Agentic / Infra). Mirrors the MORI project's
+# add-to-project pattern (connectai-biz) with Component in place of
+# Area.
+#
+# Pre-requisites (set once per repo):
+#   secrets.ADD_TO_PROJECT_PAT  — Classic PAT, scopes: repo + project
+#   vars.TALKEN_COMPONENT       — exact Component option name on the
+#                                  project (case-sensitive); skips
+#                                  silently if unset.
+
+on:
+  issues:
+    types: [opened, reopened]
+  # `pull_request_target` runs in the BASE repo context so the PAT
+  # secret is available. The `if:` guard below rejects fork PRs to
+  # neutralise the PAT-exfil escalation vector — only same-repo PRs
+  # ever see the secret.
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  # Phase 3 — author auto-assign uses POST issues/{n}/assignees.
+  # GitHub permission model: actual-Issue write needs `issues`, PR
+  # write needs `pull-requests`. PR sharing the issues endpoint still
+  # validates against the PR permission, so both scopes are required
+  # since this workflow handles both event types.
+  issues: write
+  pull-requests: write
+
+jobs:
+  add:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'issues' ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      # Phase 1 — add the issue/PR to the project. Idempotent: if the
+      # item already exists (e.g. via the project-level Auto-add
+      # workflow), this is a no-op and still surfaces the itemId so
+      # the Component step below can proceed.
+      - id: add
+        uses: actions/add-to-project@244f685bbc3b7adfa8466e08b698b5577571133e  # v1.0.2
+        with:
+          project-url: https://github.com/orgs/talken-io/projects/1
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+
+      # Phase 2 — stamp the `Component` field with this repo's value.
+      # Resolves the project / field / option IDs at runtime so a
+      # field rename or option re-add (which churns IDs) doesn't
+      # silently break the workflow.
+      #
+      # Skips silently if vars.TALKEN_COMPONENT is unset (so this
+      # template stays a drop-in for any repo even before the variable
+      # is registered).
+      - name: Set Component field
+        if: vars.TALKEN_COMPONENT != ''
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          ITEM_ID: ${{ steps.add.outputs.itemId }}
+          COMPONENT_NAME: ${{ vars.TALKEN_COMPONENT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ITEM_ID:-}" ]; then
+            echo "::warning::add-to-project did not return an itemId; skipping Component stamp"
+            exit 0
+          fi
+          echo "Stamping Component=${COMPONENT_NAME} on item ${ITEM_ID}"
+
+          PROJECT_ID=$(gh api graphql -f query='{
+            organization(login: "talken-io") {
+              projectV2(number: 1) { id }
+            }
+          }' --jq '.data.organization.projectV2.id')
+
+          FIELD_JSON=$(gh api graphql -f query='
+            query($pid: ID!) {
+              node(id: $pid) {
+                ... on ProjectV2 {
+                  field(name: "Component") {
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      options { id name }
+                    }
+                  }
+                }
+              }
+            }' -F pid="$PROJECT_ID")
+          FIELD_ID=$(echo "$FIELD_JSON" | jq -r '.data.node.field.id // empty')
+          OPTION_ID=$(echo "$FIELD_JSON" | jq -r --arg n "$COMPONENT_NAME" \
+            '.data.node.field.options[]? | select(.name == $n) | .id')
+
+          if [ -z "$FIELD_ID" ] || [ -z "$OPTION_ID" ]; then
+            echo "::warning::Component field or option '${COMPONENT_NAME}' not found on project; skipping (fields may have been renamed)"
+            exit 0
+          fi
+
+          gh project item-edit \
+            --id "$ITEM_ID" \
+            --project-id "$PROJECT_ID" \
+            --field-id "$FIELD_ID" \
+            --single-select-option-id "$OPTION_ID"
+
+          echo "✓ Component stamped"
+
+      # Phase 3 — author auto-assign. GitHub's default is no assignee
+      # on issue/PR creation, leaving the Project board "Assignees"
+      # column blank. Auto-assigning the author (issue.user /
+      # pull_request.user) restores board scannability.
+      #
+      # continue-on-error — keeps this step's failures from undoing
+      # Phase 1/2 board placement. GitHub runs the script under bash
+      # -e, so omitting `set -e` alone doesn't guarantee non-fatal.
+      - name: Auto-assign author
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.issue.user.login || github.event.pull_request.user.login }}
+        run: |
+          set -uo pipefail
+          if [ -z "${AUTHOR:-}" ] || [ -z "${NUMBER:-}" ]; then
+            echo "::warning::Missing author or number — skipping auto-assign"
+            exit 0
+          fi
+
+          # Skip if assignees already set — respect explicit assignment.
+          # On lookup ambiguity (runner anomalies / transient error),
+          # PROCEED rather than skip — POST .../assignees is additive
+          # and idempotent, so "when in doubt, assign" is the safe
+          # default. A prior implementation would skip on bad parse,
+          # leaving the board Assignees column permanently blank.
+          ALREADY=$(gh api "repos/${REPO}/issues/${NUMBER}" \
+            --jq 'if ((.assignees // []) | length) > 0 then "yes" else "no" end' \
+            2>/dev/null || echo "no")
+          if [ "$ALREADY" = "yes" ]; then
+            echo "Already has assignee(s) — skipping (explicit assignment respected)"
+            exit 0
+          fi
+
+          # PR/issue both use issues/{number}/assignees endpoint.
+          # GitHub model: PR = issue subtype, same endpoint behavior.
+          if gh api --method POST "repos/${REPO}/issues/${NUMBER}/assignees" \
+               -f "assignees[]=${AUTHOR}" --silent 2>/dev/null; then
+            echo "✓ Auto-assigned author=${AUTHOR}"
+          else
+            echo "::warning::Could not assign ${AUTHOR} on ${REPO}#${NUMBER} (non-collaborator?) — non-fatal"
+          fi
